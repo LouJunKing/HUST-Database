@@ -129,12 +129,13 @@ void BPLUSTREE_TYPE::StartNewTree(const KeyType &key, const ValueType &value) {
   page_id_t page_Id;
   Page *rootPage = buffer_pool_manager_->NewPage(&page_Id);
   B_PLUS_TREE_LEAF_PAGE_TYPE *root = reinterpret_cast<B_PLUS_TREE_LEAF_PAGE_TYPE *>(rootPage->GetData());
-  root->Init(pageId, INVALID_PAGE_ID, leaf_max_size_);
+  root->Init(page_Id, INVALID_PAGE_ID, leaf_max_size_);
 
   root_page_id_ = page_Id;
-  // UpdateRootPageId(page_Id);
-  // rootPage->Insert(key, value);
-  // buffer_pool_manager_->UnpinPage(page_Id, true);
+  UpdateRootPageId(page_Id);
+  root->Insert(key, value, comparator_);
+  buffer_pool_manager_->UnpinPage(page_Id, true);
+  
 }
 
 /*
@@ -166,13 +167,26 @@ void BPLUSTREE_TYPE::UpdateRootPageId(int insert_record) {
  */
 INDEX_TEMPLATE_ARGUMENTS
 bool BPLUSTREE_TYPE::InsertIntoLeaf(const KeyType &key, const ValueType &value) {
-
-
+  Page *page = FindLeafPage(key);
+  if(nullptr == page) {
+    return false;
+  }
+  B_PLUS_TREE_LEAF_PAGE_TYPE *bpage = reinterpret_cast<B_PLUS_TREE_LEAF_PAGE_TYPE *>(page->GetData());
+  ValueType v;
+  if(bpage->Lookup(key, &v, comparator_)) {
+    buffer_pool_manager_->UnpinPage(bpage->GetPageId(), false);
+    return false;
+  }
+  bpage->Insert(key, value, comparator_);
   //每次插入之后进行判断，是否已经超过最大值，选择直接进行分裂
   //由于MAXSIZE后还留有一个空白结点，这样可以保证插入结点而不会导致数据越界
   //这样就可以先插入，再分裂结点，避免了需要先分裂腾出空间，再插入其中一个的复杂操作
-
-
+  if(bpage->GetSize() > bpage->GetMaxSize()) {
+    B_PLUS_TREE_LEAF_PAGE_TYPE *newLeafPage = Split(bpage);
+    InsertIntoParent(bpage, newLeafPage->KeyAt(0), newLeafPage);
+  }
+  buffer_pool_manager_->UnpinPage(bpage->GetPageId(), false);
+  return true;
 }
 /*
  * 函数功能：
@@ -184,10 +198,17 @@ bool BPLUSTREE_TYPE::InsertIntoLeaf(const KeyType &key, const ValueType &value) 
 INDEX_TEMPLATE_ARGUMENTS
 template <typename N>
 N *BPLUSTREE_TYPE::Split(N *node) {
-
-
-
-
+  page_id_t new_page_id;
+  Page* page = buffer_pool_manager_->NewPage(&new_page_id);
+  N *new_node = reinterpret_cast<N *>(page->GetData());
+  if(node->IsLeafPage()) {
+    new_node->Init(new_page_id, node->GetParentPageId(), leaf_max_size_);
+  }
+  else {
+    new_node->Init(new_page_id, node->GetParentPageId(), internal_max_size_);
+  }
+  node->MoveHalfTo(new_node, buffer_pool_manager_);
+  return new_node;
 }
 
 
@@ -209,10 +230,27 @@ void BPLUSTREE_TYPE::InsertIntoParent(BPlusTreePage *old_node, const KeyType &ke
   page_id_t parentId = old_node->GetParentPageId();
   if (parentId == INVALID_PAGE_ID) {
     //此时说明是根结点，无父结点存在，需重新生成根结点
+    Page *new_root_page = buffer_pool_manager_->NewPage(&root_page_id_);
+    B_PLUS_TREE_INTERNAL_PAGE *new_root = reinterpret_cast<B_PLUS_TREE_INTERNAL_PAGE *>(new_root_page->GetData());
+    new_root->Init(root_page_id_, INVALID_PAGE_ID, internal_max_size_);
+    new_root->PopulateNewRoot(old_node->GetPageId(), key, new_node->GetPageId());
+    old_node->SetParentPageId(root_page_id_);
+    new_node->SetParentPageId(root_page_id_);
+    UpdateRootPageId();
+    buffer_pool_manager_->UnpinPage(new_root->GetPageId(), true);
+    buffer_pool_manager_->UnpinPage(old_node->GetPageId(), true);
+    buffer_pool_manager_->UnpinPage(new_node->GetPageId(), true);
   } else {
-    
-
-    
+    Page *parent_page = buffer_pool_manager_->FetchPage(parentId);
+    B_PLUS_TREE_INTERNAL_PAGE *parent_node = reinterpret_cast<B_PLUS_TREE_INTERNAL_PAGE *>(parent_page->GetData());
+    new_node->SetParentPageId(parentId);
+    parent_node->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId());
+    if(parent_node->GetSize() > parent_node->GetMaxSize()) {
+      B_PLUS_TREE_INTERNAL_PAGE *newLeafPage = Split(parent_node);
+      InsertIntoParent(parent_node, newLeafPage->KeyAt(0), newLeafPage);
+    }
+    buffer_pool_manager_->UnpinPage(parent_node->GetPageId(), true);
+    buffer_pool_manager_->UnpinPage(new_node->GetPageId(), true);
   }
 }
 
